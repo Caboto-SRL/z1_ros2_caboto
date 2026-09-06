@@ -79,3 +79,20 @@ If you want to improve something, or have some particular request, please first 
 
 As general rule, please develop your feature/bug-fix on a new branch, and create a pull request targeting the **development branch** (`devel`).
 There we will make sure that the change is working as expected, and will update the reference of the `main` branch accordingly, to guarantee the stability of such branch.
+
+## Modifiche Caboto (2026-09-06): un solo chiamante di `sendRecv()`
+
+L'SDK Unitree fa `recv` bloccante con timeout di 20 ms sul socket verso `z1_ctrl`; con il thread
+interno dell'SDK attivo e `sendRecv()` sia in `read()` sia in `write()`, le risposte finivano al
+chiamante sbagliato e il ciclo del controller manager durava in media 27 ms. Ora:
+
+- il thread dell'SDK serve solo per le transizioni FSM (`fsm_transition()`, `on_shutdown`) e viene fermato subito dopo;
+- `read()` è l'unico punto di I/O (`write()` prepara il comando, che parte nel `read()` successivo: 2 ms di latenza);
+- `update_rate` 500 Hz, pari al `dt` dell'SDK;
+- `hold_current_state()` (posizione misurata, velocità e coppia nulle, guadagni di posizione) su
+  attivazione, disattivazione, errore e per le interfacce rilasciate da un controller che si ferma.
+
+Misurato sul braccio reale: `/joint_states` a 498 Hz, overrun medi 2 ms (prima 27 ms, picchi 176 ms).
+Limiti noti: l'SDK precompilato non espone la freschezza della ricezione; l'hold riporta tutti i
+giunti ai guadagni di posizione. Per la priorità realtime del controller manager serve `rtprio`
+per l'utente (`/etc/security/limits.d/99-realtime.conf`).

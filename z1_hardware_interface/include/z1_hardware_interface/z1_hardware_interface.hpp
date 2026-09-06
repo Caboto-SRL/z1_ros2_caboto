@@ -96,6 +96,10 @@ public:
     [[nodiscard]] rclcpp::Logger& get_logger() { return _logger; }
     
     [[nodiscard]] bool with_gripper() const;
+    /// Comando = stato misurato, qd = 0, tau = 0 (braccio e pinza); inoltra all'SDK se connesso.
+    void hold_current_state();
+    /// Transizione FSM bloccante dell'SDK, con il suo thread avviato solo per la durata della chiamata.
+    bool fsm_transition(UNITREE_ARM::ArmFSMState state, const char* name);
     // clang-format on
 
 
