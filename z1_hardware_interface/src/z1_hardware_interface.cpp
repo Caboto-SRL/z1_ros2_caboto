@@ -144,7 +144,9 @@ HardwareInterface::on_shutdown(const rclcpp_lifecycle::State& prev_state) {
             RCLCPP_WARN(get_logger(), "FSM transition to JOINTCTRL not acknowledged: skipping homing");
         }
         RCLCPP_INFO(get_logger(), "Setting arm into passive state");
-        if (!_arm->setFsm(UNITREE_ARM::ArmFSMState::PASSIVE))
+        if (_arm->setFsm(UNITREE_ARM::ArmFSMState::PASSIVE))
+            RCLCPP_INFO(get_logger(), "Arm PASSIVE confirmed: clean shutdown");   // riga cercata da compass_stop.sh
+        else
             RCLCPP_WARN(get_logger(), "FSM transition to PASSIVE not acknowledged");
         RCLCPP_INFO(get_logger(), "Closing SDK connection");
         _arm->sendRecvThread->shutdown();
