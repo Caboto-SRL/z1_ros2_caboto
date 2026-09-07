@@ -107,6 +107,7 @@ HardwareInterface::on_configure(const rclcpp_lifecycle::State& prev_state) {
         return hardware_interface::CallbackReturn::ERROR;
     }
     RCLCPP_INFO(get_logger(), "SDK in low-level control; the ros2_control loop is the only sendRecv caller");
+    diag_start();
 
     RCLCPP_DEBUG(get_logger(), "on_configure() completed successfully");
     return hardware_interface::CallbackReturn::SUCCESS;
@@ -149,6 +150,7 @@ HardwareInterface::on_shutdown(const rclcpp_lifecycle::State& prev_state) {
         else
             RCLCPP_WARN(get_logger(), "FSM transition to PASSIVE not acknowledged");
         RCLCPP_INFO(get_logger(), "Closing SDK connection");
+        diag_stop();
         _arm->sendRecvThread->shutdown();
     }
     RCLCPP_DEBUG(get_logger(), "on_shutdown() completed successfully");
@@ -315,6 +317,7 @@ HardwareInterface::
         _arm_state.qd(i)  = _arm->lowstate->dq[i];
         _arm_state.tau(i) = _arm->lowstate->tau[i];
     }
+    if (++_diag_counter >= 100) { _diag_counter = 0; diag_sample(); }
     if (with_gripper()) {
         _gripper_state.q   = _arm->lowstate->q[6];
         _gripper_state.qd  = _arm->lowstate->dq[6];
@@ -466,3 +469,59 @@ split_interface(const std::string& in) {
 PLUGINLIB_EXPORT_CLASS(
         unitree::z1::HardwareInterface, hardware_interface::SystemInterface
 );
+
+
+// ---- diagnostica motori -------------------------------------------------------------
+#include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <chrono>
+
+void HardwareInterface::diag_sample() {
+    if (!_arm || !_arm->lowstate) return;
+    std::unique_lock<std::mutex> lk(_diag_mtx, std::try_to_lock);
+    if (!lk.owns_lock()) return;   // il thread di pubblicazione sta leggendo: si riprova al giro dopo
+    _diag_temperature = _arm->lowstate->temperature;
+    _diag_errorstate  = _arm->lowstate->errorstate;
+}
+
+void HardwareInterface::diag_start() {
+    if (_diag_run.exchange(true)) return;
+    _diag_thread = std::thread([this]() {
+        auto node = std::make_shared<rclcpp::Node>("z1_motor_diagnostics");
+        auto pub = node->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/z1/diagnostics", rclcpp::QoS(5));
+        auto last_warn = std::chrono::steady_clock::now() - std::chrono::seconds(10);
+        while (_diag_run.load() && rclcpp::ok()) {
+            std::vector<int> temp; std::vector<uint8_t> err;
+            { std::lock_guard<std::mutex> lk(_diag_mtx); temp = _diag_temperature; err = _diag_errorstate; }
+            diagnostic_msgs::msg::DiagnosticArray arr;
+            arr.header.stamp = node->now();
+            bool any_error = false; std::string summary;
+            for (size_t i = 0; i < temp.size() && i < 7; ++i) {
+                diagnostic_msgs::msg::DiagnosticStatus st;
+                st.name = "z1/motor" + std::to_string(i + 1);
+                st.hardware_id = "unitree_z1";
+                const uint8_t e = i < err.size() ? err[i] : 0;
+                st.level = (e & 0x04) ? diagnostic_msgs::msg::DiagnosticStatus::ERROR
+                         : (e != 0)  ? diagnostic_msgs::msg::DiagnosticStatus::WARN
+                                     : diagnostic_msgs::msg::DiagnosticStatus::OK;
+                st.message = (e & 0x04) ? "avvolgimenti surriscaldati (0x04)" : (e != 0) ? "errore motore 0x" + std::to_string(e) : "ok";
+                diagnostic_msgs::msg::KeyValue kt; kt.key = "temperature_C"; kt.value = std::to_string(temp[i]);
+                diagnostic_msgs::msg::KeyValue ke; ke.key = "errorstate"; ke.value = std::to_string(e);
+                st.values = {kt, ke};
+                arr.status.push_back(st);
+                if (e != 0) { any_error = true; summary += " motore" + std::to_string(i + 1) + "=0x" + std::to_string(e) + "(" + std::to_string(temp[i]) + "C)"; }
+            }
+            pub->publish(arr);
+            const auto now = std::chrono::steady_clock::now();
+            if (any_error && now - last_warn > std::chrono::seconds(5)) {
+                last_warn = now;
+                RCLCPP_WARN(get_logger(), "errore motori:%s", summary.c_str());
+            }
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+        }
+    });
+}
+
+void HardwareInterface::diag_stop() {
+    if (!_diag_run.exchange(false)) return;
+    if (_diag_thread.joinable()) _diag_thread.join();
+}

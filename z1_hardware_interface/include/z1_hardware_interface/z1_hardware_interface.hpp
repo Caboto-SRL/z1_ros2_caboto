@@ -106,6 +106,20 @@ public:
 private:
     rclcpp::Logger _logger = rclcpp::get_logger("z1_hardware_interface");
 
+    // Diagnostica motori (temperatura ed errorstate dell'SDK) pubblicata da un nodo
+    // separato su un thread proprio: il ciclo real-time copia i valori sotto mutex
+    // ogni ~100 cicli, il thread li pubblica a 1 Hz su /z1/diagnostics e avvisa
+    // (limitato) quando un motore segnala un errore (0x04 = surriscaldamento).
+    void diag_start();
+    void diag_stop();
+    void diag_sample();
+    std::thread _diag_thread;
+    std::atomic<bool> _diag_run{false};
+    std::mutex _diag_mtx;
+    std::vector<int> _diag_temperature;
+    std::vector<uint8_t> _diag_errorstate;
+    unsigned _diag_counter = 0;
+
     ArmPtr _arm = nullptr;
 
     Vec6   _arm_max_torque     = 20.0 * Vec6::Ones();
