@@ -38,9 +38,7 @@ public:
     RCLCPP_SHARED_PTR_DEFINITIONS(HardwareInterface)
 
     HardwareInterface()           = default;
-    ~HardwareInterface() override = default;
-
-    HardwareInterface(const HardwareInterface&)             = delete;
+HardwareInterface(const HardwareInterface&)             = delete;
     HardwareInterface(const HardwareInterface&&)            = delete;
     HardwareInterface& operator=(const HardwareInterface&)  = delete;
     HardwareInterface& operator=(const HardwareInterface&&) = delete;
@@ -110,6 +108,7 @@ private:
     // separato su un thread proprio: il ciclo real-time copia i valori sotto mutex
     // ogni ~100 cicli, il thread li pubblica a 1 Hz su /z1/diagnostics e avvisa
     // (limitato) quando un motore segnala un errore (0x04 = surriscaldamento).
+    ~HardwareInterface() override;
     void diag_start();
     void diag_stop();
     void diag_sample();
