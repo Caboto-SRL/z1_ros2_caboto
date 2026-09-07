@@ -576,7 +576,8 @@ void HardwareInterface::recover_step() {
         // Confermato: comando = posa misurata ADESSO (nessuno scatto), poi il controller
         // riprende e il limitatore di passo tiene comunque limitata la ripresa.
         hold_current_state();
-        _last_sent_valid = false;
+        _last_sent_q = _arm_cmd.q;      // = posa misurata: il limitatore di passo parte da qui, mai un ciclo senza limite
+        _last_sent_valid = true;
         _recovering = false;
         RCLCPP_WARN(get_logger(), "riaggancio riuscito dopo %u cicli: braccio in LOWCMD, hold sulla posa misurata", _recover_cycles);
         return;
