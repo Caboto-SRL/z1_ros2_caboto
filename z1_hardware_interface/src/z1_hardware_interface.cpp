@@ -116,6 +116,8 @@ HardwareInterface::on_configure(const rclcpp_lifecycle::State& prev_state) {
 hardware_interface::CallbackReturn
 HardwareInterface::on_cleanup(const rclcpp_lifecycle::State& prev_state) {
     RCLCPP_DEBUG(get_logger(), "calling on_cleanup()");
+    diag_stop();
+    _active.store(false);
     if (hardware_interface::SystemInterface::on_cleanup(prev_state)
         != hardware_interface::CallbackReturn::SUCCESS) {
         RCLCPP_ERROR(get_logger(), "parent on_cleanup() failed");
@@ -215,6 +217,9 @@ HardwareInterface::on_error(const rclcpp_lifecycle::State& prev_state) {
         RCLCPP_ERROR(get_logger(), "parent on_error() failed");
         return hardware_interface::CallbackReturn::ERROR;
     }
+    _active.store(false);
+    _recover_request.store(false);
+    diag_stop();
     if (_arm) {
         // Arresto sicuro: tiene la posa (niente homing, niente PASSIVE che farebbe
         // cadere il braccio). Dopo il ritorno le read() cessano, quindi l'hold va
@@ -312,14 +317,14 @@ HardwareInterface::export_command_interfaces() {
 hardware_interface::return_type
 HardwareInterface::
         read(const rclcpp::Time& /* time */, const rclcpp::Duration& /* period */) {
-    if (_recovering.load()) return hardware_interface::return_type::OK;   // il thread di recupero usa il socket
+    recover_step();     // prima dello scambio: puo' impostare lo stato richiesto nel comando
     _arm->sendRecv();
     // Sorveglianza del firmware: con l'hardware attivo lo stato riportato deve essere
     // LOWCMD. Se non lo e' per 100 cicli (0.2 s) e non c'e' una disconnessione in corso,
-    // si chiede il riaggancio (rate-limited nel thread di diagnostica).
-    if (_active.load() && !_recovering.load()) {
-        const bool disc = _arm->_ctrlComp && _arm->_ctrlComp->udp && _arm->_ctrlComp->udp->isDisConnect;
-        const bool lowcmd = _arm->_ctrlComp && _arm->_ctrlComp->recvState.state == UNITREE_ARM::ArmFSMState::LOWCMD;
+    // si avvia il riaggancio nel ciclo stesso.
+    if (_active.load() && !_recovering && _arm->_ctrlComp) {
+        const bool disc = _arm->_ctrlComp->udp && _arm->_ctrlComp->udp->isDisConnect;
+        const bool lowcmd = _arm->_ctrlComp->recvState.state == UNITREE_ARM::ArmFSMState::LOWCMD;
         if (!disc && !lowcmd) { if (++_bad_state_cycles >= 100) { _bad_state_cycles = 0; request_recover("stato FSM del braccio non LOWCMD"); } }
         else _bad_state_cycles = 0;
     }
@@ -340,8 +345,9 @@ HardwareInterface::
 hardware_interface::return_type
 HardwareInterface::
         write(const rclcpp::Time& /* time */, const rclcpp::Duration& /* period */) {
-    if (_recovering.load()) return hardware_interface::return_type::OK;
+    if (_recovering) return hardware_interface::return_type::OK;   // durante il riaggancio si manda solo la richiesta di stato
     saturate_torque();
+    slew_limit_cmd();
     _arm->setArmCmd(_arm_cmd.q, _arm_cmd.qd, _arm_cmd.tau);
     if (with_gripper()) _arm->setGripperCmd(_gripper_cmd.q, _gripper_cmd.qd, _gripper_cmd.tau);
     // Nessun sendRecv qui: il comando parte nel read() del ciclo successivo
@@ -529,7 +535,6 @@ void HardwareInterface::diag_start() {
             }
             pub->publish(arr);
             exec.spin_some(std::chrono::milliseconds(50));
-            if (_recover_request.load()) do_recover();
             const auto now = std::chrono::steady_clock::now();
             if (any_error && now - last_warn > std::chrono::seconds(5)) {
                 last_warn = now;
@@ -545,23 +550,56 @@ void HardwareInterface::diag_stop() {
     if (_diag_thread.joinable()) _diag_thread.join();
 }
 
+HardwareInterface::~HardwareInterface() { diag_stop(); }
+
 void HardwareInterface::request_recover(const char* why) {
     { std::lock_guard<std::mutex> lk(_recover_mtx); _recover_why = why; }
     _recover_request.store(true);
 }
 
-void HardwareInterface::do_recover() {
-    _recover_request.store(false);
-    const auto now = std::chrono::steady_clock::now();
-    if (now - _last_recover < std::chrono::seconds(5)) return;   // al massimo uno ogni 5 s
-    _last_recover = now;
-    std::string why; { std::lock_guard<std::mutex> lk(_recover_mtx); why = _recover_why; }
-    RCLCPP_WARN(get_logger(), "riaggancio del braccio (%s): il ciclo real-time sospende sendRecv, transizione a LOWCMD", why.c_str());
-    _recovering.store(true);
-    std::this_thread::sleep_for(std::chrono::milliseconds(10));   // il ciclo RT vede il flag
-    const bool ok = fsm_transition(UNITREE_ARM::ArmFSMState::LOWCMD, "LOWCMD");
-    if (ok) hold_current_state();   // comando = stato misurato: nessuno scatto alla ripresa
-    _recovering.store(false);
-    if (ok) RCLCPP_WARN(get_logger(), "riaggancio riuscito: braccio di nuovo in LOWCMD, hold sulla posa misurata");
-    else RCLCPP_ERROR(get_logger(), "riaggancio FALLITO: il braccio non risponde alla transizione (spento? acceso da poco?)");
+void HardwareInterface::recover_step() {
+    // Chiamata dal ciclo RT (unico utente del socket). Stato: idle -> (richiesta) ->
+    // in corso: ogni ciclo si chiede LOWCMD nel comando UDP finche' il braccio lo
+    // conferma (max 2 s), poi il comando riparte dalla posa misurata.
+    if (!_arm || !_arm->_ctrlComp) return;
+    if (_recover_backoff.load() > 0) { _recover_backoff.fetch_sub(1); return; }
+    if (!_recovering) {
+        if (!_recover_request.exchange(false)) return;
+        if (!_active.load()) return;
+        std::string why; { std::lock_guard<std::mutex> lk(_recover_mtx); why = _recover_why; }
+        RCLCPP_WARN(get_logger(), "riaggancio del braccio (%s): richiesta LOWCMD nel comando UDP", why.c_str());
+        _recovering = true; _recover_cycles = 0;
+    }
+    ++_recover_cycles;
+    _arm->_ctrlComp->sendCmd.state = UNITREE_ARM::ArmFSMState::LOWCMD;   // come setFsm(LOWCMD), ma senza thread
+    if (_arm->_ctrlComp->recvState.state == UNITREE_ARM::ArmFSMState::LOWCMD && _recover_cycles > 5) {
+        // Confermato: comando = posa misurata ADESSO (nessuno scatto), poi il controller
+        // riprende e il limitatore di passo tiene comunque limitata la ripresa.
+        hold_current_state();
+        _last_sent_valid = false;
+        _recovering = false;
+        RCLCPP_WARN(get_logger(), "riaggancio riuscito dopo %u cicli: braccio in LOWCMD, hold sulla posa misurata", _recover_cycles);
+        return;
+    }
+    if (_recover_cycles > 1000) {   // 2 s a 500 Hz
+        _recovering = false;
+        _recover_backoff.store(2500);   // 5 s prima di riprovare
+        _recover_request.store(true);
+        RCLCPP_ERROR(get_logger(), "riaggancio FALLITO: il braccio non conferma LOWCMD (spento? acceso da poco?), nuovo tentativo fra 5 s");
+    }
+}
+
+void HardwareInterface::slew_limit_cmd() {
+    // Passo massimo per ciclo del comando di posizione: 1 rad/s. I controller normali
+    // stanno sotto (0.4 rad/s di picco): non li tocca; un riferimento distante (dopo
+    // un riaggancio, o un controller che riparte) diventa un movimento lento.
+    if (_last_sent_valid) {
+        for (long i = 0; i < 6; ++i) {
+            const double d = _arm_cmd.q(i) - _last_sent_q(i);
+            if (d > _max_cmd_step_rad) _arm_cmd.q(i) = _last_sent_q(i) + _max_cmd_step_rad;
+            else if (d < -_max_cmd_step_rad) _arm_cmd.q(i) = _last_sent_q(i) - _max_cmd_step_rad;
+        }
+    }
+    _last_sent_q = _arm_cmd.q;
+    _last_sent_valid = true;
 }

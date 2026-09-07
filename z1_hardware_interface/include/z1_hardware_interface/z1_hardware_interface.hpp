@@ -113,19 +113,27 @@ private:
     void diag_start();
     void diag_stop();
     void diag_sample();
-    // Riaggancio automatico: se, con l'hardware attivo, lo stato FSM riportato dal
-    // braccio non e' LOWCMD (firmware ripartito in PASSIVE dopo una perdita UDP o uno
-    // spegnimento), il thread di diagnostica rifa' la transizione mentre il ciclo
-    // real-time sospende sendRecv. Anche a richiesta (servizio /z1/rehandshake).
+    // Riaggancio automatico, TUTTO nel ciclo real-time (nessun thread tocca l'SDK):
+    // se, con l'hardware attivo, lo stato FSM riportato dal braccio non e' LOWCMD
+    // (firmware ripartito in PASSIVE dopo una perdita UDP o uno spegnimento), read()
+    // chiede LOWCMD nel comando UDP (come fa setFsm dell'SDK) finche' il braccio non
+    // lo conferma, poi il comando riparte dalla posa MISURATA. Il servizio
+    // /z1/rehandshake alza solo un flag. Il limitatore di passo in write() rende
+    // comunque limitato qualunque salto fra comando e posa reale.
     void request_recover(const char* why);
-    void do_recover();
+    void recover_step();            // chiamata da read() con il socket in mano
+    void slew_limit_cmd();          // chiamata da write(): passo massimo per ciclo
     std::atomic<bool> _active{false};
     std::atomic<bool> _recover_request{false};
-    std::atomic<bool> _recovering{false};
+    bool _recovering = false;                       // solo dal ciclo RT
+    unsigned _recover_cycles = 0;
+    std::atomic<int> _recover_backoff{0};           // cicli di attesa dopo un tentativo fallito
     std::string _recover_why;
     std::mutex _recover_mtx;
-    std::chrono::steady_clock::time_point _last_recover{};
     unsigned _bad_state_cycles = 0;
+    Vec6 _last_sent_q = Vec6::Zero();
+    bool _last_sent_valid = false;
+    double _max_cmd_step_rad = 0.002;               // 1 rad/s a 500 Hz: mai raggiunto dai controller normali
     std::thread _diag_thread;
     std::atomic<bool> _diag_run{false};
     std::mutex _diag_mtx;
