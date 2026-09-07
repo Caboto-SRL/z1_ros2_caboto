@@ -24,4 +24,5 @@
     <build_type>ament_cmake</build_type>
   </export>
   <depend>diagnostic_msgs</depend>
+  <depend>std_srvs</depend>
 </package>

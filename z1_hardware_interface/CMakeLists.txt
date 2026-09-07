@@ -17,6 +17,7 @@ set(ROS2_REQUIRED_COMPONENTS
     rclcpp
     rclcpp_lifecycle
     diagnostic_msgs
+    std_srvs
     )
 
 foreach(COMPONENT ${ROS2_REQUIRED_COMPONENTS})

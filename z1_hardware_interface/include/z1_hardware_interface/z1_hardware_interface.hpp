@@ -113,6 +113,19 @@ private:
     void diag_start();
     void diag_stop();
     void diag_sample();
+    // Riaggancio automatico: se, con l'hardware attivo, lo stato FSM riportato dal
+    // braccio non e' LOWCMD (firmware ripartito in PASSIVE dopo una perdita UDP o uno
+    // spegnimento), il thread di diagnostica rifa' la transizione mentre il ciclo
+    // real-time sospende sendRecv. Anche a richiesta (servizio /z1/rehandshake).
+    void request_recover(const char* why);
+    void do_recover();
+    std::atomic<bool> _active{false};
+    std::atomic<bool> _recover_request{false};
+    std::atomic<bool> _recovering{false};
+    std::string _recover_why;
+    std::mutex _recover_mtx;
+    std::chrono::steady_clock::time_point _last_recover{};
+    unsigned _bad_state_cycles = 0;
     std::thread _diag_thread;
     std::atomic<bool> _diag_run{false};
     std::mutex _diag_mtx;

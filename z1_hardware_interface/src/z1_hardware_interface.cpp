@@ -179,7 +179,7 @@ HardwareInterface::on_activate(const rclcpp_lifecycle::State& prev_state) {
             return hardware_interface::CallbackReturn::ERROR;
         }
     }
-    // TODO
+    _active.store(true);
     RCLCPP_DEBUG(get_logger(), "on_activate() completed successfully");
     return hardware_interface::CallbackReturn::SUCCESS;
 }
@@ -195,6 +195,7 @@ HardwareInterface::on_deactivate(const rclcpp_lifecycle::State& prev_state) {
         RCLCPP_ERROR(get_logger(), "parent on_deactivate() failed");
         return hardware_interface::CallbackReturn::ERROR;
     }
+    _active.store(false);
     // INACTIVE: read() continua a girare e trasmette il comando in cache -> hold esplicito
     hold_current_state();
     RCLCPP_INFO(get_logger(), "Arm deactivated: holding measured pose (qd = 0, tau = 0)");
@@ -311,7 +312,17 @@ HardwareInterface::export_command_interfaces() {
 hardware_interface::return_type
 HardwareInterface::
         read(const rclcpp::Time& /* time */, const rclcpp::Duration& /* period */) {
+    if (_recovering.load()) return hardware_interface::return_type::OK;   // il thread di recupero usa il socket
     _arm->sendRecv();
+    // Sorveglianza del firmware: con l'hardware attivo lo stato riportato deve essere
+    // LOWCMD. Se non lo e' per 100 cicli (0.2 s) e non c'e' una disconnessione in corso,
+    // si chiede il riaggancio (rate-limited nel thread di diagnostica).
+    if (_active.load() && !_recovering.load()) {
+        const bool disc = _arm->_ctrlComp && _arm->_ctrlComp->udp && _arm->_ctrlComp->udp->isDisConnect;
+        const bool lowcmd = _arm->_ctrlComp && _arm->_ctrlComp->recvState.state == UNITREE_ARM::ArmFSMState::LOWCMD;
+        if (!disc && !lowcmd) { if (++_bad_state_cycles >= 100) { _bad_state_cycles = 0; request_recover("stato FSM del braccio non LOWCMD"); } }
+        else _bad_state_cycles = 0;
+    }
     for (long i = 0; i < 6; ++i) {
         _arm_state.q(i)   = _arm->lowstate->q[i];
         _arm_state.qd(i)  = _arm->lowstate->dq[i];
@@ -329,6 +340,7 @@ HardwareInterface::
 hardware_interface::return_type
 HardwareInterface::
         write(const rclcpp::Time& /* time */, const rclcpp::Duration& /* period */) {
+    if (_recovering.load()) return hardware_interface::return_type::OK;
     saturate_torque();
     _arm->setArmCmd(_arm_cmd.q, _arm_cmd.qd, _arm_cmd.tau);
     if (with_gripper()) _arm->setGripperCmd(_gripper_cmd.q, _gripper_cmd.qd, _gripper_cmd.tau);
@@ -473,6 +485,7 @@ PLUGINLIB_EXPORT_CLASS(
 
 // ---- diagnostica motori -------------------------------------------------------------
 #include <diagnostic_msgs/msg/diagnostic_array.hpp>
+#include <std_srvs/srv/trigger.hpp>
 #include <chrono>
 
 void HardwareInterface::diag_sample() {
@@ -488,6 +501,10 @@ void HardwareInterface::diag_start() {
     _diag_thread = std::thread([this]() {
         auto node = std::make_shared<rclcpp::Node>("z1_motor_diagnostics");
         auto pub = node->create_publisher<diagnostic_msgs::msg::DiagnosticArray>("/z1/diagnostics", rclcpp::QoS(5));
+        auto srv = node->create_service<std_srvs::srv::Trigger>("/z1/rehandshake",
+            [this](const std::shared_ptr<std_srvs::srv::Trigger::Request>, std::shared_ptr<std_srvs::srv::Trigger::Response> res) {
+                request_recover("richiesta dell'operatore"); res->success = true; res->message = "riaggancio richiesto"; });
+        rclcpp::executors::SingleThreadedExecutor exec; exec.add_node(node);
         auto last_warn = std::chrono::steady_clock::now() - std::chrono::seconds(10);
         while (_diag_run.load() && rclcpp::ok()) {
             std::vector<int> temp; std::vector<uint8_t> err;
@@ -511,6 +528,8 @@ void HardwareInterface::diag_start() {
                 if (e != 0) { any_error = true; summary += " motore" + std::to_string(i + 1) + "=0x" + std::to_string(e) + "(" + std::to_string(temp[i]) + "C)"; }
             }
             pub->publish(arr);
+            exec.spin_some(std::chrono::milliseconds(50));
+            if (_recover_request.load()) do_recover();
             const auto now = std::chrono::steady_clock::now();
             if (any_error && now - last_warn > std::chrono::seconds(5)) {
                 last_warn = now;
@@ -524,4 +543,25 @@ void HardwareInterface::diag_start() {
 void HardwareInterface::diag_stop() {
     if (!_diag_run.exchange(false)) return;
     if (_diag_thread.joinable()) _diag_thread.join();
+}
+
+void HardwareInterface::request_recover(const char* why) {
+    { std::lock_guard<std::mutex> lk(_recover_mtx); _recover_why = why; }
+    _recover_request.store(true);
+}
+
+void HardwareInterface::do_recover() {
+    _recover_request.store(false);
+    const auto now = std::chrono::steady_clock::now();
+    if (now - _last_recover < std::chrono::seconds(5)) return;   // al massimo uno ogni 5 s
+    _last_recover = now;
+    std::string why; { std::lock_guard<std::mutex> lk(_recover_mtx); why = _recover_why; }
+    RCLCPP_WARN(get_logger(), "riaggancio del braccio (%s): il ciclo real-time sospende sendRecv, transizione a LOWCMD", why.c_str());
+    _recovering.store(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(10));   // il ciclo RT vede il flag
+    const bool ok = fsm_transition(UNITREE_ARM::ArmFSMState::LOWCMD, "LOWCMD");
+    if (ok) hold_current_state();   // comando = stato misurato: nessuno scatto alla ripresa
+    _recovering.store(false);
+    if (ok) RCLCPP_WARN(get_logger(), "riaggancio riuscito: braccio di nuovo in LOWCMD, hold sulla posa misurata");
+    else RCLCPP_ERROR(get_logger(), "riaggancio FALLITO: il braccio non risponde alla transizione (spento? acceso da poco?)");
 }
